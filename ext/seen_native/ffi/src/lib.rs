@@ -1,14 +1,15 @@
 use magnus::scan_args::scan_args;
 use magnus::typed_data::Obj;
-use magnus::value::LazyId;
+use magnus::value::{LazyId, Opaque};
 use magnus::{
-    DataTypeFunctions, Enumerator, Error, ExceptionClass, RArray, RHash, RModule, RString, Ruby,
-    Symbol, TryConvert, TypedData, Value, function, kwargs, method, prelude::*,
+    DataTypeFunctions, Error, ExceptionClass, IntoValue, RArray, RHash, RModule, RString, Ruby,
+    Symbol, TryConvert, TypedData, Value, function, gc, kwargs, method, prelude::*,
 };
 use seen_core::{
     FILE_TYPES, GrepConfig, GrepFormat, GrepMatch, GrepPosition, SearchConfig, SearchError,
     grep_stream, search_stream,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -145,6 +146,44 @@ impl From<StreamEvent> for ActiveEvent {
 enum StreamItem {
     Search(Vec<u8>),
     Grep(GrepMatch),
+}
+
+/// Only Ruby values and integers may remain on the native stack while yielding.
+/// In particular, Ruby can discard an Enumerator's Fiber without running Rust
+/// destructors, so all owned buffers must stay in its GC-managed cursor.
+enum PreparedItem {
+    Path(RString),
+    Line(RString, u64, RString),
+    Column(RString, u64, u64, RString),
+    ByteRange(RString, u64, magnus::Range, RString),
+}
+
+impl PreparedItem {
+    fn yield_values(self, ruby: &Ruby) -> Result<Value, Error> {
+        match self {
+            Self::Path(path) => ruby.yield_value(path),
+            Self::Line(path, number, text) => ruby.yield_values((path, number, text)),
+            Self::Column(path, number, column, text) => {
+                ruby.yield_values((path, number, column, text))
+            }
+            Self::ByteRange(path, number, range, text) => {
+                ruby.yield_values((path, number, range, text))
+            }
+        }
+    }
+
+    fn into_values(self, ruby: &Ruby) -> Value {
+        match self {
+            Self::Path(path) => (path,).into_value_with(ruby),
+            Self::Line(path, number, text) => (path, number, text).into_value_with(ruby),
+            Self::Column(path, number, column, text) => {
+                (path, number, column, text).into_value_with(ruby)
+            }
+            Self::ByteRange(path, number, range, text) => {
+                (path, number, range, text).into_value_with(ruby)
+            }
+        }
+    }
 }
 
 impl ActiveEvent {
@@ -310,7 +349,7 @@ impl StreamSession {
     }
 
     fn take_ready(&self) -> Option<StreamNext> {
-        if self.inherited() {
+        if self.inherited() || self.cancelled.load(Ordering::Relaxed) {
             return Some(Self::cancelled());
         }
 
@@ -443,12 +482,132 @@ impl Drop for StreamSource {
     }
 }
 
-struct StopStream<'a>(&'a StreamSession);
+struct CloseCursor<'a>(&'a StreamCursor);
 
-impl Drop for StopStream<'_> {
+impl Drop for CloseCursor<'_> {
     fn drop(&mut self) {
-        self.0.cancel();
+        self.0.close();
     }
+}
+
+/// Owns every iteration's buffers and session, including native block iteration
+/// reached through composed Enumerators. GC closes a discarded Fiber's cursor
+/// even when Ruby cannot unwind the native yield loop.
+#[derive(TypedData)]
+#[magnus(class = "Seen::Cursor", free_immediately, mark)]
+struct StreamCursor {
+    operation: &'static str,
+    session: RefCell<Option<Arc<StreamSession>>>,
+    active: RefCell<Option<ActiveEvent>>,
+    line: RefCell<Option<Arc<[u8]>>>,
+    text: Cell<Option<Opaque<RString>>>,
+    scheduler: Option<(Opaque<Value>, Opaque<Value>)>,
+    scheduler_items: Cell<usize>,
+}
+
+impl DataTypeFunctions for StreamCursor {
+    fn mark(&self, marker: &gc::Marker) {
+        if let Some(text) = self.text.get() {
+            marker.mark(text);
+        }
+        if let Some((scheduler, io)) = self.scheduler {
+            marker.mark(scheduler);
+            marker.mark(io);
+        }
+    }
+}
+
+impl StreamCursor {
+    fn close(&self) {
+        if let Some(session) = self.session.borrow_mut().take() {
+            session.cancel();
+        }
+        drop(self.active.borrow_mut().take());
+        drop(self.line.borrow_mut().take());
+        self.text.set(None);
+    }
+
+    fn next_item(&self, ruby: &Ruby) -> Result<Option<PreparedItem>, Error> {
+        let Some(session) = self.session.borrow().as_ref().map(Arc::clone) else {
+            return Ok(None);
+        };
+        let wait = self.scheduler.map(|(scheduler, io)| SchedulerWait {
+            scheduler: ruby.get_inner(scheduler),
+            io: ruby.get_inner(io),
+        });
+        let item = loop {
+            let item = self
+                .active
+                .borrow_mut()
+                .as_mut()
+                .and_then(ActiveEvent::next);
+            if let Some(item) = item {
+                break item;
+            }
+            drop(self.active.borrow_mut().take());
+            let next = wait_next(ruby, &session, wait.as_ref())?;
+            match next {
+                StreamNext::Event(event) => *self.active.borrow_mut() = Some(event.into()),
+                StreamNext::Outcome(Outcome::Done(result)) => {
+                    self.close();
+                    result.map_err(|error| core_error(ruby, self.operation, &error))?;
+                    return Ok(None);
+                }
+                StreamNext::Outcome(Outcome::Panicked(panic)) => resume_unwind(panic),
+            }
+        };
+        ruby.thread_check_ints()?;
+        let mut line = self
+            .line
+            .borrow()
+            .as_ref()
+            .map(Arc::clone)
+            .zip(self.text.get())
+            .map(|(bytes, text)| (bytes, ruby.get_inner(text)));
+        let prepared = prepare_stream_item(ruby, item, &mut line)?;
+        if let Some((bytes, text)) = line {
+            *self.line.borrow_mut() = Some(bytes);
+            self.text.set(Some(text.into()));
+        }
+        if let Some(wait) = wait {
+            let items = self.scheduler_items.get() + 1;
+            self.scheduler_items.set(items % SCHEDULER_YIELD_ITEMS);
+            if items == SCHEDULER_YIELD_ITEMS {
+                wait.yield_now()?;
+            }
+        }
+        Ok(Some(prepared))
+    }
+
+    fn next_values(ruby: &Ruby, rb_self: Obj<Self>) -> Result<Value, Error> {
+        Ok(rb_self
+            .next_item(ruby)?
+            .map_or_else(|| ruby.qnil().as_value(), |item| item.into_values(ruby)))
+    }
+}
+
+impl Drop for StreamCursor {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn stream_cursor(ruby: &Ruby, source: &StreamSource) -> Result<Obj<StreamCursor>, Error> {
+    let session = source.start(ruby)?;
+    let mut cursor = StreamCursor {
+        operation: source.operation(),
+        session: RefCell::new(Some(Arc::clone(&session))),
+        active: RefCell::new(None),
+        line: RefCell::new(None),
+        text: Cell::new(None),
+        scheduler: None,
+        scheduler_items: Cell::new(0),
+    };
+    cursor.scheduler = current_scheduler(ruby)?
+        .map(|scheduler| SchedulerWait::new(ruby, &session, scheduler))
+        .transpose()?
+        .map(|wait| (wait.scheduler.into(), wait.io.into()));
+    Ok(ruby.obj_wrap(cursor))
 }
 
 fn convert_array<T: TryConvert>(array: RArray) -> Result<Vec<T>, Error> {
@@ -751,16 +910,16 @@ impl SchedulerWait {
     }
 }
 
-fn yield_stream_item(
+fn prepare_stream_item(
     ruby: &Ruby,
     item: StreamItem,
     line: &mut Option<(Arc<[u8]>, RString)>,
-) -> Result<(), Error> {
-    match item {
+) -> Result<PreparedItem, Error> {
+    Ok(match item {
         StreamItem::Search(bytes) => {
             let path = path_string(ruby, &bytes);
             drop(bytes);
-            let _: Value = ruby.yield_value(path)?;
+            PreparedItem::Path(path)
         }
         StreamItem::Grep(matched) => {
             let GrepMatch {
@@ -785,93 +944,72 @@ fn yield_stream_item(
             };
             drop(path_bytes);
             drop(line_bytes);
-            let _: Value = match position {
+            match position {
                 Some(GrepPosition::Column(column)) => {
-                    ruby.yield_values((path, line_number, column, text))?
+                    PreparedItem::Column(path, line_number, column, text)
                 }
                 // A `Range` so `text.byteslice(range)` returns the match,
                 // with the exclusive end `rg --json` reports.
                 Some(GrepPosition::ByteRange { offset, length }) => {
                     let range = ruby.range_new(offset, offset.saturating_add(length), true)?;
-                    ruby.yield_values((path, line_number, range, text))?
+                    PreparedItem::ByteRange(path, line_number, range, text)
                 }
-                None => ruby.yield_values((path, line_number, text))?,
-            };
+                None => PreparedItem::Line(path, line_number, text),
+            }
         }
+    })
+}
+
+fn current_scheduler(ruby: &Ruby) -> Result<Option<Value>, Error> {
+    let fiber: Value = ruby.class_object().const_get("Fiber")?;
+    let scheduler: Value = fiber.funcall("scheduler", ())?;
+    let current: Value = fiber.funcall("current", ())?;
+    Ok(
+        (!scheduler.is_nil() && !current.funcall::<_, _, bool>("blocking?", ())?)
+            .then_some(scheduler),
+    )
+}
+
+fn wait_next(
+    ruby: &Ruby,
+    session: &StreamSession,
+    wait: Option<&SchedulerWait>,
+) -> Result<StreamNext, Error> {
+    let Some(wait) = wait else {
+        return session.wait(ruby);
+    };
+    loop {
+        if let Some(next) = session.take_ready() {
+            return Ok(next);
+        }
+        session.drain_signal();
+        if let Some(next) = session.take_ready() {
+            return Ok(next);
+        }
+        wait.wait()?;
     }
-    Ok(())
 }
 
 fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
     let source: &StreamSource = TryConvert::try_convert(rb_self)?;
-    let operation = source.operation();
-    let fiber: Value = ruby.class_object().const_get("Fiber")?;
-    let scheduler: Value = fiber.funcall("scheduler", ())?;
-    let current: Value = fiber.funcall("current", ())?;
-    let scheduler_enabled =
-        !scheduler.is_nil() && !current.funcall::<_, _, bool>("blocking?", ())?;
-    let session = source.start(ruby)?;
-    let scheduler_wait = scheduler_enabled
-        .then(|| SchedulerWait::new(ruby, session.as_ref(), scheduler))
-        .transpose()?;
-    let _stop = StopStream(session.as_ref());
-    // Retaining the Arc makes identity safe across batch boundaries.
-    let mut line: Option<(Arc<[u8]>, RString)> = None;
-    let mut active: Option<ActiveEvent> = None;
-    let mut scheduler_items = 0;
-
-    loop {
-        if let Some(item) = active.as_mut().and_then(ActiveEvent::next) {
-            ruby.thread_check_ints()?;
-            yield_stream_item(ruby, item, &mut line)?;
-            if let Some(wait) = &scheduler_wait {
-                scheduler_items += 1;
-                if scheduler_items == SCHEDULER_YIELD_ITEMS {
-                    scheduler_items = 0;
-                    wait.yield_now()?;
-                }
-            }
-            continue;
-        }
-        drop(active.take());
-        let next = if let Some(wait) = &scheduler_wait {
-            loop {
-                if let Some(next) = session.take_ready() {
-                    break next;
-                }
-                session.drain_signal();
-                if let Some(next) = session.take_ready() {
-                    break next;
-                }
-                wait.wait()?;
-            }
-        } else {
-            session.wait(ruby)?
-        };
-        ruby.thread_check_ints()?;
-
-        match next {
-            StreamNext::Event(event) => active = Some(event.into()),
-            StreamNext::Outcome(Outcome::Done(result)) => {
-                result.map_err(|error| core_error(ruby, operation, &error))?;
-                return Ok(ruby.qnil().as_value());
-            }
-            StreamNext::Outcome(Outcome::Panicked(panic)) => resume_unwind(panic),
-        }
+    let cursor = stream_cursor(ruby, source)?;
+    let _close = CloseCursor(&cursor);
+    while let Some(item) = cursor.next_item(ruby)? {
+        item.yield_values(ruby)?;
     }
+    Ok(ruby.qnil().as_value())
 }
 
-fn seen_each_path(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
+fn seen_each_path(ruby: &Ruby, args: &[Value]) -> Result<Obj<StreamSource>, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
     let file_type = extract_file_types(ruby, kwargs)?;
     let config = build_search_config(ruby, kwargs, &PATTERN, file_type)?;
 
-    let source: Obj<StreamSource> = ruby.obj_wrap(StreamSource::new(StreamConfig::Search(config)));
-    Ok(source.enumeratorize("each", ()))
+    Ok(ruby.obj_wrap(StreamSource::new(StreamConfig::Search(config))))
 }
 
-fn seen_each_line(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
+fn seen_each_line(ruby: &Ruby, args: &[Value]) -> Result<Obj<StreamSource>, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
     if let Some(value) = kwargs.get(*PATTERN)
@@ -905,8 +1043,7 @@ fn seen_each_line(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
         format,
         search,
     };
-    let source: Obj<StreamSource> = ruby.obj_wrap(StreamSource::new(StreamConfig::Grep(config)));
-    Ok(source.enumeratorize("each", ()))
+    Ok(ruby.obj_wrap(StreamSource::new(StreamConfig::Grep(config))))
 }
 
 #[magnus::init]
@@ -922,7 +1059,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let error = seen_module.define_module("Error")?;
     let stream = seen_module.define_class("Stream", ruby.class_object())?;
     stream.define_method("each", method!(stream_each, 0))?;
-    let _: Value = seen_module.funcall("private_constant", ("Stream",))?;
+    stream.define_method("cursor", method!(stream_cursor, 0))?;
+    let cursor = seen_module.define_class("Cursor", ruby.class_object())?;
+    cursor.define_method("next_values", method!(StreamCursor::next_values, 0))?;
+    cursor.define_method("close", method!(StreamCursor::close, 0))?;
+    let _: Value = seen_module.funcall("private_constant", ("Stream", "Cursor"))?;
 
     for (name, superclass) in [
         ("InvalidPattern", ruby.exception_regexp_error()),

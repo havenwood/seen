@@ -15,6 +15,60 @@ module Seen
   CWD = ["."].freeze
   private_constant :CWD
 
+  # Every iteration owns a cursor. Direct external iteration can also close its
+  # cursor explicitly before Ruby discards its Fiber on rewind.
+  class Results < ::Enumerator
+    def initialize(source)
+      @source = source
+      @cursor = nil
+      super() { |output| @source.each { |*values| output.yield(*values) } }
+      @external = ::Enumerator.new do |output|
+        cursor = @cursor = @source.cursor
+        begin
+          while (values = cursor.next_values)
+            output.yield(*values)
+          end
+        ensure
+          cursor.close
+          @cursor = nil if @cursor.equal?(cursor)
+        end
+      end
+    end
+
+    def each(&)
+      return self unless block_given?
+
+      @source.each(&)
+    end
+
+    def next = @external.next
+    def next_values = @external.next_values
+    def peek = @external.peek
+    def peek_values = @external.peek_values
+    def feed(value) = @external.feed(value)
+
+    def freeze
+      @external.freeze
+      super
+    end
+
+    def rewind
+      raise FrozenError, "can't modify frozen #{self.class}" if frozen?
+
+      @cursor&.close
+      @cursor = nil
+      @external.rewind
+      super
+    end
+
+    def initialize_copy(other)
+      super
+      @external.dup # Preserve Enumerator's refusal to copy live external iteration.
+      initialize(@source)
+    end
+  end
+  private_constant :Results
+
   class << self
     def each_path(
       pattern: nil,
@@ -60,6 +114,7 @@ module Seen
         changed_within:,
         changed_before:
       )
+      results = Results.new(results)
       results.each(&)
       results
     end
@@ -122,6 +177,7 @@ module Seen
         changed_within:,
         changed_before:
       )
+      results = Results.new(results)
       results.each(&)
       results
     end

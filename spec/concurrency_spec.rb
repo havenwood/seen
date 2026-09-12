@@ -196,6 +196,61 @@ describe "Seen concurrency" do
     Integer(output)
   end
 
+  def assert_rewind_releases_resources(kind, wrapper = "direct")
+    path = File.join(@dir, "rewind.txt")
+    File.write(path, "needle\n" * 100_000)
+    script = <<~'RUBY'
+      require "seen"
+      require "timeout"
+
+      def resources
+        threads = if File.directory?("/proc/self/task")
+          Dir.children("/proc/self/task").size
+        else
+          IO.popen(["ps", "-M", "-p", Process.pid.to_s], &:read).lines.size - 1
+        end
+        [threads, Dir.children("/dev/fd").size]
+      end
+
+      path, kind, wrapper = ARGV
+      source = if kind == "path"
+        Seen.each_path(paths: Array.new(100_000, path), no_ignore: true)
+      else
+        Seen.each_line(pattern: "needle", paths: [path])
+      end
+      results = case wrapper
+      when "direct" then source
+      when "with_index" then source.with_index
+      when "with_object" then source.with_object(nil)
+      when "lazy" then source.lazy.map { |value| value }.select { true }
+      when "to_enum" then source.to_enum
+      when "chain" then source.chain([]).to_enum
+      end
+      baseline = resources
+      20.times do
+        results.next
+        results.rewind
+        GC.start
+      end
+      begin
+        Timeout.timeout(5) do
+          sleep 0.01 until resources.zip(baseline).all? { |actual, before| actual <= before + 2 }
+        end
+      rescue Timeout::Error
+        abort "#{kind}/#{wrapper}: threads/fds before=#{baseline.inspect}, after=#{resources.inspect}"
+      end
+      abort "rewind did not restart" unless results.next
+      results.rewind
+      puts "released #{kind}/#{wrapper} workers and descriptors"
+    RUBY
+    output, status = Open3.capture2e(
+      {"RUBYOPT" => nil, "RUBYLIB" => nil}, Gem.ruby,
+      "-I#{File.expand_path("../lib", __dir__)}", "-e", script, path, kind, wrapper
+    )
+
+    assert_predicate status, :success?, output
+  end
+
   it "releases the GVL so other threads run during search" do
     during = ticks_during { Seen.each_path(paths: [@dir], hidden: true).to_a }
     assert_predicate during, :positive?, "other threads should run during Seen.each_path"
@@ -249,6 +304,82 @@ describe "Seen concurrency" do
   it "cancels workers when consumption stops early" do
     Timeout.timeout(5) do
       100.times { assert_kind_of String, Seen.each_path(paths: [@dir], hidden: true).first }
+    end
+  end
+
+  it "releases native path workers and descriptors after rewind" do
+    assert_rewind_releases_resources("path")
+  end
+
+  it "releases native line workers and descriptors after rewind" do
+    assert_rewind_releases_resources("line")
+  end
+
+  %w[with_index with_object lazy to_enum chain].each do |wrapper|
+    %w[path line].each do |kind|
+      it "releases native #{kind} resources after #{wrapper} rewind" do
+        assert_rewind_releases_resources(kind, wrapper)
+      end
+    end
+  end
+
+  it "keeps composed iterations independent when one is rewound" do
+    [Seen.each_path(paths: [@dir], type: "f"), Seen.each_line(pattern: "needle", paths: [@dir])].each do |source|
+      left = source.lazy
+      right = source.with_index
+      left.next
+      assert_equal 0, right.next.last
+      left.rewind
+      GC.start
+
+      assert_equal 199, count_external(right)
+      assert_equal 200, count_external(left)
+    end
+  end
+
+  it "keeps native cursor state alive across GC inside a yielded block" do
+    path = File.join(@dir, "compact.txt")
+    File.write(path, "needle " * 40)
+    texts = []
+
+    Seen.each_line(pattern: "needle", paths: [path], column: true) do |_, _, _, text|
+      GC.start
+      GC.compact
+      texts << text
+    end
+
+    assert_equal 40, texts.size
+    assert_equal 1, texts.map(&:object_id).uniq.size
+    assert_equal "needle " * 40, texts.first
+  end
+
+  it "rewinds external iteration without cancelling an independent each" do
+    [Seen.each_path(paths: [@dir], type: "f"), Seen.each_line(pattern: "needle", paths: [@dir])].each do |results|
+      started = Queue.new
+      resume = Queue.new
+      thread = Thread.new do
+        count = 0
+        results.each do
+          count += 1
+          if count == 1
+            started << true
+            resume.pop
+          end
+        end
+        count
+      end
+
+      Timeout.timeout(5) do
+        started.pop
+        results.next
+        results.rewind
+        resume << true
+        assert_equal 200, thread.value
+        assert_equal 200, count_external(results)
+      end
+    ensure
+      thread&.kill
+      thread&.join
     end
   end
 

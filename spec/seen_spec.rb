@@ -81,6 +81,35 @@ describe Seen do
       assert_includes results.to_a, first
     end
 
+    it "preserves external iteration methods across rewind" do
+      results = Seen.each_path(pattern: '^seen\.rb$', paths: ["lib"])
+      assert_equal ["lib/seen.rb"], results.peek_values
+      assert_equal "lib/seen.rb", results.peek
+      assert_equal ["lib/seen.rb"], results.next_values
+      assert_nil results.feed(:ignored)
+      assert_raises(StopIteration) { results.next }
+      assert_same results, results.rewind
+      assert_equal "lib/seen.rb", results.next
+      results.rewind
+    end
+
+    it "copies unstarted enumerators with independent external cursors" do
+      results = Seen.each_path(paths: ["lib"], max_depth: 1)
+      copy = results.dup
+      expected = results.to_a.sort
+
+      results.next
+      copy.next
+      assert_raises(TypeError) { results.dup }
+      assert_raises(TypeError) { copy.dup }
+      results.rewind
+      copy.rewind
+      assert_equal expected, Array.new(expected.size) { results.next }.sort
+      assert_equal expected, Array.new(expected.size) { copy.next }.sort
+      results.rewind
+      copy.rewind
+    end
+
     it "omits the ./ prefix when paths defaults, as fd does" do
       results = Seen.each_path(pattern: "^LICENSE$").to_a
 
